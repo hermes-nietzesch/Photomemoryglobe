@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import type { RawMemoryInput, StorageHealthState, StorageRecoveryInfo } from '../shared/types.ts';
 
 export interface MemoryStoreOptions {
@@ -134,10 +135,36 @@ export class MemoryStore {
         throw new Error('Photo index must be a non-empty JSON array of valid memory records.');
       }
 
-      this.memories = parsed;
+      let backfilledCount = 0;
+      const hydrated: RawMemoryInput[] = [];
+      for (const mem of parsed) {
+        if (!mem.contentHash && mem.filePath) {
+          try {
+            const buf = await fs.readFile(mem.filePath);
+            const contentHash = crypto.createHash('sha256').update(buf).digest('hex');
+            hydrated.push({ ...mem, contentHash });
+            backfilledCount++;
+            continue;
+          } catch {
+            // Photo file is missing/unreadable; keep the legacy record untouched
+          }
+        }
+        hydrated.push(mem);
+      }
+
+      this.memories = hydrated;
       this.state = 'loaded';
       this.recovery = null;
       this.revision++;
+
+      if (backfilledCount > 0) {
+        try {
+          await this.save(hydrated);
+        } catch {
+          // Keep in-memory backfilled hashes even if disk is temporarily read-only
+        }
+      }
+
       return { state: this.state, memories: this.memories, recovery: null };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);

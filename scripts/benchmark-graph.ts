@@ -73,23 +73,22 @@ const RUNS = 5;
 const dataset = generateHeavilyTaggedAlbum(PHOTO_COUNT);
 
 const durations: number[] = [];
-let peakHeapDeltaMb = 0;
-let peakRssMb = 0;
+const retainedHeapDeltasMb: number[] = [];
+let maxObservedHeapUsedMb = 0;
 let lastEdgeCount = 0;
 let crossEventPersonEdges = 0;
 
 for (let run = 0; run < RUNS; run++) {
-  const beforeMem = process.memoryUsage();
+  const beforeHeap = process.memoryUsage().heapUsed;
   const t0 = performance.now();
   const graph = buildMemoryGraph(dataset);
   const elapsed = performance.now() - t0;
-  const afterMem = process.memoryUsage();
+  const afterHeap = process.memoryUsage().heapUsed;
 
   durations.push(elapsed);
-  const heapDeltaMb = (afterMem.heapUsed - beforeMem.heapUsed) / (1024 * 1024);
-  const rssMb = afterMem.rss / (1024 * 1024);
-  if (heapDeltaMb > peakHeapDeltaMb) peakHeapDeltaMb = heapDeltaMb;
-  if (rssMb > peakRssMb) peakRssMb = rssMb;
+  retainedHeapDeltasMb.push((afterHeap - beforeHeap) / (1024 * 1024));
+  const afterHeapMb = afterHeap / (1024 * 1024);
+  if (afterHeapMb > maxObservedHeapUsedMb) maxObservedHeapUsedMb = afterHeapMb;
   lastEdgeCount = graph.edges.length;
 
   if (run === RUNS - 1) {
@@ -102,8 +101,11 @@ for (let run = 0; run < RUNS; run++) {
   }
 }
 
-const sorted = [...durations].sort((a, b) => a - b);
-const median = sorted[Math.floor(sorted.length / 2)];
+const sortedDurations = [...durations].sort((a, b) => a - b);
+const medianMs = sortedDurations[Math.floor(sortedDurations.length / 2)];
+const maxPostBuildHeapDeltaMb = Math.max(...retainedHeapDeltasMb);
+// OS-tracked high-water mark (process.resourceUsage().maxRSS is in kilobytes)
+const osPeakRssMb = process.resourceUsage().maxRSS / 1024;
 
 console.log(
   JSON.stringify(
@@ -111,11 +113,12 @@ console.log(
       photoCount: PHOTO_COUNT,
       runs: RUNS,
       coldMs: Number(durations[0].toFixed(2)),
-      medianMs: Number(median.toFixed(2)),
-      minMs: Number(sorted[0].toFixed(2)),
-      maxMs: Number(sorted[sorted.length - 1].toFixed(2)),
-      peakHeapDeltaMb: Number(peakHeapDeltaMb.toFixed(2)),
-      peakRssMb: Number(peakRssMb.toFixed(2)),
+      medianMs: Number(medianMs.toFixed(2)),
+      minMs: Number(sortedDurations[0].toFixed(2)),
+      maxMs: Number(sortedDurations[sortedDurations.length - 1].toFixed(2)),
+      maxPostBuildHeapDeltaMb: Number(maxPostBuildHeapDeltaMb.toFixed(2)),
+      maxObservedHeapUsedMb: Number(maxObservedHeapUsedMb.toFixed(2)),
+      osPeakRssMb: Number(osPeakRssMb.toFixed(2)),
       synapseEdges: lastEdgeCount,
       crossEventPersonEdges,
     },

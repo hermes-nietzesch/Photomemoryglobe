@@ -376,4 +376,136 @@ describe('Graph caching, 1,500-photo scale, repeat imports & cross-year E2E (Iss
       );
     }
   });
+
+  it('upgrade: backfills contentHash for legacy main index entries while preserving IDs/metadata and skipping re-imports via both routes', async () => {
+    const legacyPhotoPath = path.join(album2023Dir, 'kyoto_gate.png');
+    const missingPhotoPath = path.join(tmpDir, 'offline-drive', 'missing.png');
+
+    // Simulate an index created by `main` (path-based SHA-1 id, custom enriched metadata, no contentHash)
+    const legacyIndex = [
+      {
+        id: 'mem-legacy-sha1-id',
+        title: 'My Hand-Edited Kyoto Title',
+        caption: 'Preserved custom reflection from main',
+        timestamp: Date.parse('2023-11-04T07:00:00Z'),
+        locationName: 'Kyoto, Japan',
+        lat: 34.9671,
+        lng: 135.7727,
+        people: ['Maya', 'Kenji'],
+        event: 'Kyoto Autumn 2023',
+        themes: ['Golden Hour', 'Architecture'],
+        mood: 'Serene',
+        imageUrl: '/api/media/mem-legacy-sha1-id',
+        filePath: legacyPhotoPath,
+        source: 'takeout',
+        enriched: true,
+      },
+      {
+        id: 'mem-legacy-offline-id',
+        title: 'Unplugged Drive Photo',
+        caption: 'Still preserved even if file is currently unreadable',
+        timestamp: Date.parse('2022-08-10T15:00:00Z'),
+        locationName: 'Reykjavik, Iceland',
+        people: ['Liam'],
+        event: 'Iceland 2022',
+        themes: ['Ocean Coastlines'],
+        mood: 'Crisp',
+        imageUrl: '/api/media/mem-legacy-offline-id',
+        filePath: missingPhotoPath,
+        source: 'takeout',
+        enriched: false,
+      },
+    ];
+
+    await fs.mkdir(dataDir, { recursive: true });
+    await fs.writeFile(path.join(dataDir, 'memories.json'), JSON.stringify(legacyIndex, null, 2), 'utf-8');
+
+    const ctx = createServerApp({ dataDir });
+    const loaded = await ctx.store.load();
+    assert.equal(loaded.state, 'loaded');
+    assert.equal(loaded.recovery, null);
+
+    // Readable legacy entry got contentHash backfilled while preserving its exact ID and metadata
+    const upgradedReadable = ctx.store.getMemories().find((m) => m.id === 'mem-legacy-sha1-id');
+    assert.ok(upgradedReadable);
+    assert.ok(upgradedReadable.contentHash && upgradedReadable.contentHash.length === 64);
+    assert.equal(upgradedReadable.title, 'My Hand-Edited Kyoto Title');
+    assert.equal(upgradedReadable.caption, 'Preserved custom reflection from main');
+    assert.deepEqual(upgradedReadable.people, ['Maya', 'Kenji']);
+    assert.equal(upgradedReadable.enriched, true);
+
+    // Unreadable legacy entry was preserved intact without failing load
+    const preservedOffline = ctx.store.getMemories().find((m) => m.id === 'mem-legacy-offline-id');
+    assert.ok(preservedOffline);
+    assert.equal(preservedOffline.contentHash, undefined);
+
+    // Verify backfilled contentHash was persisted atomically to disk
+    const persistedOnDisk = JSON.parse(
+      await fs.readFile(path.join(dataDir, 'memories.json'), 'utf-8')
+    ) as RawMemoryInput[];
+    assert.equal(persistedOnDisk[0].id, 'mem-legacy-sha1-id');
+    assert.equal(persistedOnDisk[0].contentHash, upgradedReadable.contentHash);
+
+    const server = await new Promise<http.Server>((resolve) => {
+      const s = ctx.app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    try {
+      // Legacy media URL still resolves with the original ID
+      const mediaRes = await fetch(`${baseUrl}/api/media/mem-legacy-sha1-id`, {
+        headers: LOCAL_HEADERS,
+      });
+      assert.equal(mediaRes.status, 200);
+      assert.deepEqual(Buffer.from(await mediaRes.arrayBuffer()), PNG_A);
+
+      // Re-import the same photo through /api/import/folder -> expect 0 added, 1 skipped
+      const folderReimport = await fetch(`${baseUrl}/api/import/folder`, {
+        method: 'POST',
+        headers: { ...LOCAL_HEADERS, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folderPath: album2023Dir, append: true }),
+      });
+      assert.equal(folderReimport.status, 200);
+      const folderJson = (await folderReimport.json()) as {
+        added: number;
+        skipped: number;
+        graph: MemoryGraph;
+      };
+      assert.equal(folderJson.added, 0);
+      assert.equal(folderJson.skipped, 1);
+      assert.equal(folderJson.graph.memories.length, 2);
+      const afterFolder = folderJson.graph.memories.find((m) => m.id === 'mem-legacy-sha1-id');
+      assert.equal(afterFolder?.title, 'My Hand-Edited Kyoto Title');
+
+      // Re-import the same photo through /api/import/upload -> expect 0 added, 1 skipped
+      const form = new FormData();
+      form.append('append', 'true');
+      form.append('files', new Blob([PNG_A], { type: 'image/png' }), 'kyoto_gate.png');
+      const uploadReimport = await fetch(`${baseUrl}/api/import/upload`, {
+        method: 'POST',
+        headers: LOCAL_HEADERS,
+        body: form,
+      });
+      assert.equal(uploadReimport.status, 200);
+      const uploadJson = (await uploadReimport.json()) as {
+        added: number;
+        skipped: number;
+        graph: MemoryGraph;
+      };
+      assert.equal(uploadJson.added, 0);
+      assert.equal(uploadJson.skipped, 1);
+      assert.equal(uploadJson.graph.memories.length, 2);
+      const afterUpload = uploadJson.graph.memories.find((m) => m.id === 'mem-legacy-sha1-id');
+      assert.equal(afterUpload?.title, 'My Hand-Edited Kyoto Title');
+      assert.equal(afterUpload?.caption, 'Preserved custom reflection from main');
+
+      // Duplicate uploaded file should have been cleaned up
+      const uploadFiles = await fs.readdir(ctx.uploadDir);
+      assert.equal(uploadFiles.length, 0);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((err) => (err ? reject(err) : resolve()))
+      );
+    }
+  });
 });
