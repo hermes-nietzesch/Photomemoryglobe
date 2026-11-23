@@ -135,11 +135,13 @@ export async function parseSinglePhoto(
   }
 ): Promise<RawMemoryInput> {
   const stat = await fs.stat(imagePath);
+  const fileBuffer = await fs.readFile(imagePath);
+  const contentHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
   const sidecar = options?.overrideSidecar ?? (await findTakeoutSidecar(imagePath));
 
   let exifData: Record<string, unknown> | null = null;
   try {
-    exifData = (await exifr.parse(imagePath, {
+    exifData = (await exifr.parse(fileBuffer, {
       gps: true,
       pick: ['DateTimeOriginal', 'CreateDate', 'latitude', 'longitude', 'ImageDescription'],
     })) as Record<string, unknown> | null;
@@ -188,7 +190,7 @@ export async function parseSinglePhoto(
     (typeof exifData?.ImageDescription === 'string' ? exifData.ImageDescription.trim() : '') ||
     `Imported from ${folderName}`;
 
-  const id = `mem-${crypto.createHash('sha1').update(imagePath).digest('hex').slice(0, 12)}`;
+  const id = `mem-${contentHash.slice(0, 12)}`;
   const locationName = inferPlaceFromCoords(lat, lng);
   const event = inferEventFromFolderAndDate(folderName, timestamp);
   const themes = inferBasicThemes(timestamp, folderName, lat);
@@ -207,6 +209,7 @@ export async function parseSinglePhoto(
     mood: 'Captured',
     imageUrl: `/api/media/${id}`,
     filePath: imagePath,
+    contentHash,
     source: options?.source ?? 'takeout',
     enriched: false,
   };

@@ -30,6 +30,12 @@ const DEFAULT_PALETTES: Array<[string, string, string]> = [
   ['#6366f1', '#c084fc', '#090d1f'],
 ];
 
+const FOUR_DAYS_MS = 4 * 24 * 60 * 60 * 1000;
+const BUCKET_EXHAUSTIVE_LIMIT = 40;
+const BUCKET_LOCAL_WINDOW = 10;
+const BUCKET_STRIDE_SAMPLES = 12;
+const TEMPORAL_WINDOW_LIMIT = 14;
+
 export function formatDateLabel(timestamp: number): string {
   const d = new Date(timestamp);
   if (Number.isNaN(d.getTime())) return 'Timeless';
@@ -64,6 +70,103 @@ function fibonacciSpherePoint(index: number, total: number, radius: number): [nu
 
 function normalizeTag(value: string): string {
   return value.trim();
+}
+
+function addBucketMembers(
+  bucket: number[],
+  posInBucket: number,
+  selfIdx: number,
+  out: Set<number>
+): void {
+  const len = bucket.length;
+  if (len <= 1) return;
+
+  if (len <= BUCKET_EXHAUSTIVE_LIMIT) {
+    for (let k = 0; k < len; k++) {
+      const idx = bucket[k];
+      if (idx !== selfIdx) out.add(idx);
+    }
+    return;
+  }
+
+  // Local temporal window around this memory inside the sorted bucket
+  const start = Math.max(0, posInBucket - BUCKET_LOCAL_WINDOW);
+  const end = Math.min(len - 1, posInBucket + BUCKET_LOCAL_WINDOW);
+  for (let k = start; k <= end; k++) {
+    const idx = bucket[k];
+    if (idx !== selfIdx) out.add(idx);
+  }
+
+  // Evenly strided representatives across the entire bucket so cross-year / cross-event bridges stay connected
+  const step = Math.max(1, Math.floor((len - 1) / BUCKET_STRIDE_SAMPLES));
+  for (let k = 0; k < len; k += step) {
+    const idx = bucket[k];
+    if (idx !== selfIdx) out.add(idx);
+  }
+  const lastIdx = bucket[len - 1];
+  if (lastIdx !== selfIdx) out.add(lastIdx);
+}
+
+function scorePair(
+  a: MemoryNode,
+  b: MemoryNode,
+  aPeople: Set<string>,
+  aThemes: Set<string>
+): SynapseEdge | null {
+  const reasons: Array<{ kind: SynapseKind; label: string }> = [];
+  let score = 0;
+
+  if (a.event && b.event && a.event === b.event) {
+    reasons.push({ kind: 'event', label: a.event });
+    score += 0.55;
+  }
+
+  for (const person of b.people) {
+    if (aPeople.has(person)) {
+      reasons.push({ kind: 'person', label: person });
+      score += 0.48;
+    }
+  }
+
+  if (a.locationName && b.locationName && a.locationName === b.locationName) {
+    reasons.push({ kind: 'place', label: a.locationName });
+    score += 0.42;
+  }
+
+  for (const theme of b.themes) {
+    if (aThemes.has(theme)) {
+      reasons.push({ kind: 'theme', label: theme });
+      score += 0.36;
+    }
+  }
+
+  if (reasons.length === 0) {
+    const timeDiff = Math.abs(a.timestamp - b.timestamp);
+    if (timeDiff <= FOUR_DAYS_MS) {
+      reasons.push({ kind: 'event', label: 'Same Week' });
+      score += 0.3;
+    } else {
+      return null;
+    }
+  }
+
+  const isCrossEvent = a.event !== b.event;
+  const primaryReason =
+    (isCrossEvent ? reasons.find((r) => r.kind === 'person' || r.kind === 'theme') : undefined) ??
+    reasons[0];
+
+  const weight = Math.min(1, score + (isCrossEvent ? 0.14 : 0));
+  const [srcId, tgtId] = a.id < b.id ? [a.id, b.id] : [b.id, a.id];
+
+  return {
+    id: `${srcId}__${tgtId}`,
+    source: srcId,
+    target: tgtId,
+    kind: primaryReason.kind,
+    label: primaryReason.label,
+    weight,
+    reasons,
+  };
 }
 
 export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
@@ -146,7 +249,6 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
     // --- Neural Dome position (even 360° cortical shell R = 54..80 around viewer) ---
     const fib = fibonacciSpherePoint(idx, sorted.length, 68);
     const anchor = eventAnchors.get(item.event) ?? fib;
-    // Blend 65% golden-sphere distribution + 35% event anchor so memories fill the entire 360° dome cleanly
     let nx = fib[0] * 0.65 + anchor[0] * 0.35 + seededNoise(item.id, 1) * 10;
     let ny = fib[1] * 0.65 + anchor[1] * 0.35 + seededNoise(item.id, 2) * 10;
     let nz = fib[2] * 0.65 + anchor[2] * 0.35 + seededNoise(item.id, 3) * 10;
@@ -163,7 +265,6 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
       const bucketIndex = geoBucketCounts.get(bucketKey) || 0;
       geoBucketCounts.set(bucketKey, bucketIndex + 1);
 
-      // Gentle spiral offset around the exact GPS coordinate so memories in the same city form a delicate halo
       const angle = bucketIndex * 2.39996;
       const spreadDeg = Math.min(bucketIndex * 1.4, 6.0);
       const latOffset = Math.cos(angle) * spreadDeg * 0.65;
@@ -175,7 +276,6 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
         altitude
       );
     } else {
-      // Orbital memory halo for non-geotagged memories
       const angle = (idx / Math.max(sorted.length, 1)) * Math.PI * 2;
       const r = 74 + seededNoise(item.id, 7) * 5;
       const y = seededNoise(item.id, 8) * 14;
@@ -228,97 +328,127 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
     };
   });
 
-  // 3. Build Synaptic Connections (rich yet uncluttered: cap max synapses per node so it looks like a glowing neural web, not a hairball)
-  const candidatesByNode = new Map<string, Array<{ other: string; edge: SynapseEdge }>>();
+  // 3. Build Inverted Indexes so synapse scoring scales smoothly on 1,500+ heavily tagged photos
+  const byEvent = new Map<string, number[]>();
+  const byPerson = new Map<string, number[]>();
+  const byPlace = new Map<string, number[]>();
+  const byTheme = new Map<string, number[]>();
+
+  // Record each node's index within each bucket for O(1) windowed sampling
+  const eventPos = new Int32Array(memories.length);
+  const placePos = new Int32Array(memories.length);
+  const personPositions: Array<Array<{ bucket: number[]; pos: number }>> = new Array(memories.length);
+  const themePositions: Array<Array<{ bucket: number[]; pos: number }>> = new Array(memories.length);
+
+  for (let i = 0; i < memories.length; i++) {
+    const m = memories[i];
+    if (m.event) {
+      let arr = byEvent.get(m.event);
+      if (!arr) {
+        arr = [];
+        byEvent.set(m.event, arr);
+      }
+      eventPos[i] = arr.length;
+      arr.push(i);
+    }
+    if (m.locationName) {
+      let arr = byPlace.get(m.locationName);
+      if (!arr) {
+        arr = [];
+        byPlace.set(m.locationName, arr);
+      }
+      placePos[i] = arr.length;
+      arr.push(i);
+    }
+
+    const pEntries: Array<{ bucket: number[]; pos: number }> = [];
+    for (const person of m.people) {
+      let arr = byPerson.get(person);
+      if (!arr) {
+        arr = [];
+        byPerson.set(person, arr);
+      }
+      pEntries.push({ bucket: arr, pos: arr.length });
+      arr.push(i);
+    }
+    personPositions[i] = pEntries;
+
+    const tEntries: Array<{ bucket: number[]; pos: number }> = [];
+    for (const theme of m.themes) {
+      let arr = byTheme.get(theme);
+      if (!arr) {
+        arr = [];
+        byTheme.set(theme, arr);
+      }
+      tEntries.push({ bucket: arr, pos: arr.length });
+      arr.push(i);
+    }
+    themePositions[i] = tEntries;
+  }
+
+  // 4. Select top K synapses per node directly without materializing all O(N^2) pairs in heap memory
+  const MAX_SYNAPSES_PER_NODE = memories.length > 150 ? 4 : 6;
   const pairSeen = new Set<string>();
+  const edges: SynapseEdge[] = [];
+  const candidates = new Set<number>();
 
   for (let i = 0; i < memories.length; i++) {
     const a = memories[i];
-    for (let j = i + 1; j < memories.length; j++) {
-      const b = memories[j];
-      const reasons: Array<{ kind: SynapseKind; label: string }> = [];
-      let score = 0;
+    candidates.clear();
 
-      // Shared event
-      if (a.event && b.event && a.event === b.event) {
-        reasons.push({ kind: 'event', label: a.event });
-        score += 0.55;
-      }
-
-      // Shared people
-      for (const person of a.people) {
-        if (b.people.includes(person)) {
-          reasons.push({ kind: 'person', label: person });
-          score += 0.48;
-        }
-      }
-
-      // Shared place
-      if (a.locationName && b.locationName && a.locationName === b.locationName) {
-        reasons.push({ kind: 'place', label: a.locationName });
-        score += 0.42;
-      }
-
-      // Shared themes
-      for (const theme of a.themes) {
-        if (b.themes.includes(theme)) {
-          reasons.push({ kind: 'theme', label: theme });
-          score += 0.36;
-        }
-      }
-
-      // Temporal proximity (within 4 days)
-      const daysDiff = Math.abs(a.timestamp - b.timestamp) / (1000 * 60 * 60 * 24);
-      if (daysDiff <= 4 && reasons.length === 0) {
-        reasons.push({ kind: 'event', label: 'Same Week' });
-        score += 0.3;
-      }
-
-      if (reasons.length === 0) continue;
-
-      // Prefer diverse cross-memory synapses (people/themes bridging different events get a boost!)
-      const isCrossEvent = a.event !== b.event;
-      const primaryReason =
-        (isCrossEvent ? reasons.find((r) => r.kind === 'person' || r.kind === 'theme') : undefined) ??
-        reasons[0];
-
-      const weight = Math.min(1, score + (isCrossEvent ? 0.14 : 0));
-      const edge: SynapseEdge = {
-        id: `${a.id}__${b.id}`,
-        source: a.id,
-        target: b.id,
-        kind: primaryReason.kind,
-        label: primaryReason.label,
-        weight,
-        reasons,
-      };
-
-      if (!candidatesByNode.has(a.id)) candidatesByNode.set(a.id, []);
-      if (!candidatesByNode.has(b.id)) candidatesByNode.set(b.id, []);
-      candidatesByNode.get(a.id)!.push({ other: b.id, edge });
-      candidatesByNode.get(b.id)!.push({ other: a.id, edge });
+    if (a.event) {
+      const bucket = byEvent.get(a.event);
+      if (bucket) addBucketMembers(bucket, eventPos[i], i, candidates);
     }
-  }
-
-  // Keep top K strongest synapses per node (plus ensure cross-event bridges exist so you can traverse the whole brain!)
-  const MAX_SYNAPSES_PER_NODE = memories.length > 150 ? 4 : 6;
-  const edges: SynapseEdge[] = [];
-
-  for (const node of memories) {
-    const list = candidatesByNode.get(node.id) ?? [];
-    list.sort((x, y) => y.edge.weight - x.edge.weight);
-
-    // Pick a balanced mix: top same-event/place links + top cross-event neural bridges
-    const selected: SynapseEdge[] = [];
-    const crossLinks = list.filter((c) => c.edge.kind === 'person' || c.edge.kind === 'theme').slice(0, 3);
-    const otherLinks = list.filter((c) => !crossLinks.includes(c));
-
-    for (const c of [...crossLinks, ...otherLinks]) {
-      if (selected.length >= MAX_SYNAPSES_PER_NODE) break;
-      selected.push(c.edge);
+    if (a.locationName) {
+      const bucket = byPlace.get(a.locationName);
+      if (bucket) addBucketMembers(bucket, placePos[i], i, candidates);
+    }
+    for (const entry of personPositions[i]) {
+      addBucketMembers(entry.bucket, entry.pos, i, candidates);
+    }
+    for (const entry of themePositions[i]) {
+      addBucketMembers(entry.bucket, entry.pos, i, candidates);
     }
 
-    for (const edge of selected) {
+    // Bounded temporal neighbors within ±4 days in sorted timestamp order
+    for (let j = i - 1; j >= Math.max(0, i - TEMPORAL_WINDOW_LIMIT); j--) {
+      if (a.timestamp - memories[j].timestamp > FOUR_DAYS_MS) break;
+      candidates.add(j);
+    }
+    for (let j = i + 1; j <= Math.min(memories.length - 1, i + TEMPORAL_WINDOW_LIMIT); j++) {
+      if (memories[j].timestamp - a.timestamp > FOUR_DAYS_MS) break;
+      candidates.add(j);
+    }
+
+    if (candidates.size === 0) continue;
+
+    const aPeople = new Set(a.people);
+    const aThemes = new Set(a.themes);
+    const scored: SynapseEdge[] = [];
+
+    for (const j of candidates) {
+      const edge = scorePair(a, memories[j], aPeople, aThemes);
+      if (edge) scored.push(edge);
+    }
+
+    scored.sort((x, y) => y.weight - x.weight);
+
+    // Balanced selection: preserve cross-event person/theme bridges alongside same-event/place neighbors
+    const crossLinks: SynapseEdge[] = [];
+    const otherLinks: SynapseEdge[] = [];
+    for (const e of scored) {
+      if ((e.kind === 'person' || e.kind === 'theme') && crossLinks.length < 3) {
+        crossLinks.push(e);
+      } else {
+        otherLinks.push(e);
+      }
+    }
+
+    let picked = 0;
+    for (const edge of [...crossLinks, ...otherLinks]) {
+      if (picked >= MAX_SYNAPSES_PER_NODE) break;
+      picked++;
       if (!pairSeen.has(edge.id)) {
         pairSeen.add(edge.id);
         edges.push(edge);
@@ -337,13 +467,14 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
     const a = memories[i];
     const b = memories[i + 1];
     if ((degreeMap.get(a.id) || 0) < 2) {
-      const key = `${a.id}__${b.id}`;
+      const [srcId, tgtId] = a.id < b.id ? [a.id, b.id] : [b.id, a.id];
+      const key = `${srcId}__${tgtId}`;
       if (!pairSeen.has(key)) {
         pairSeen.add(key);
         edges.push({
           id: key,
-          source: a.id,
-          target: b.id,
+          source: srcId,
+          target: tgtId,
           kind: 'event',
           label: 'Timeline Thread',
           weight: 0.42,

@@ -63,6 +63,7 @@ export class MemoryStore {
   private memories: RawMemoryInput[];
   private state: StorageHealthState = 'demo';
   private recovery: StorageRecoveryInfo | null = null;
+  private revision = 0;
   private writeChain: Promise<void> = Promise.resolve();
 
   constructor(options: MemoryStoreOptions) {
@@ -87,6 +88,10 @@ export class MemoryStore {
     return this.recovery;
   }
 
+  public getRevision(): number {
+    return this.revision;
+  }
+
   /**
    * Loads the saved photo index from disk.
    * - ENOENT (first launch): cleanly uses demo memories with state = 'demo'.
@@ -104,6 +109,7 @@ export class MemoryStore {
         this.memories = [...this.demoMemories];
         this.state = 'demo';
         this.recovery = null;
+        this.revision++;
         return { state: this.state, memories: this.memories, recovery: null };
       }
 
@@ -118,6 +124,7 @@ export class MemoryStore {
         detail,
         detectedAt: new Date().toISOString(),
       };
+      this.revision++;
       return { state: this.state, memories: this.memories, recovery: this.recovery };
     }
 
@@ -130,6 +137,7 @@ export class MemoryStore {
       this.memories = parsed;
       this.state = 'loaded';
       this.recovery = null;
+      this.revision++;
       return { state: this.state, memories: this.memories, recovery: null };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -143,6 +151,7 @@ export class MemoryStore {
         detail,
         detectedAt: new Date().toISOString(),
       };
+      this.revision++;
       return { state: this.state, memories: this.memories, recovery: this.recovery };
     }
   }
@@ -211,6 +220,7 @@ export class MemoryStore {
       this.memories = nextMemories;
       this.state = 'loaded';
       this.recovery = null;
+      this.revision++;
       result = { archivedDamagedPath };
     });
 
@@ -236,6 +246,7 @@ export class MemoryStore {
       this.memories = [...this.demoMemories];
       this.state = 'demo';
       this.recovery = null;
+      this.revision++;
       result = { archivedDamagedPath };
     });
 

@@ -10,6 +10,7 @@ import { parseSinglePhoto, scanTakeoutFolder } from './takeoutImporter.ts';
 import { enrichMemoriesWithGemini } from './geminiEnricher.ts';
 import { MemoryStore } from './memoryStore.ts';
 import { createLocalApiGuard } from './originGuard.ts';
+import { mergeImportedMemories } from './importDeduper.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +22,13 @@ export interface CreateServerOptions {
   demoMemories?: RawMemoryInput[];
 }
 
+export interface GraphCacheStats {
+  builds: number;
+  hits: number;
+  misses: number;
+  cachedRevision: number;
+}
+
 export function createServerApp(options?: CreateServerOptions) {
   const dataDir = path.resolve(options?.dataDir ?? path.join(ROOT_DIR, '.data'));
   const uploadDir = path.join(dataDir, 'uploads');
@@ -29,16 +37,42 @@ export function createServerApp(options?: CreateServerOptions) {
 
   const store = new MemoryStore({ storePath, demoMemories });
 
+  // Cached graph keyed by MemoryStore revision so repeated GET /api/graph calls do zero rebuild work
+  let cachedRevision = -1;
+  let cachedGraph: MemoryGraph | null = null;
+  let cacheBuilds = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
+
   async function ensureUploadDir(): Promise<void> {
     await fs.mkdir(uploadDir, { recursive: true });
   }
 
-  function buildResponseGraph(): MemoryGraph {
-    const graph = buildMemoryGraph(store.getMemories());
-    return {
-      ...graph,
+  function getCachedResponseGraph(): { graph: MemoryGraph; hit: boolean } {
+    const rev = store.getRevision();
+    if (cachedGraph && cachedRevision === rev) {
+      cacheHits++;
+      return { graph: cachedGraph, hit: true };
+    }
+
+    cacheMisses++;
+    cacheBuilds++;
+    const built = buildMemoryGraph(store.getMemories());
+    cachedGraph = {
+      ...built,
       storageState: store.getState(),
       storageRecovery: store.getRecovery(),
+    };
+    cachedRevision = rev;
+    return { graph: cachedGraph, hit: false };
+  }
+
+  function getGraphCacheStats(): GraphCacheStats {
+    return {
+      builds: cacheBuilds,
+      hits: cacheHits,
+      misses: cacheMisses,
+      cachedRevision,
     };
   }
 
@@ -74,15 +108,18 @@ export function createServerApp(options?: CreateServerOptions) {
   });
 
   app.get('/api/graph', (_req, res) => {
-    res.json(buildResponseGraph());
+    const { graph, hit } = getCachedResponseGraph();
+    res.setHeader('X-Graph-Cache', hit ? 'HIT' : 'MISS');
+    res.json(graph);
   });
 
   app.post('/api/storage/reload', async (_req, res) => {
     const loaded = await store.load();
+    const { graph } = getCachedResponseGraph();
     res.json({
       storageState: loaded.state,
       storageRecovery: loaded.recovery,
-      graph: buildResponseGraph(),
+      graph,
     });
   });
 
@@ -123,25 +160,23 @@ export function createServerApp(options?: CreateServerOptions) {
         return;
       }
 
-      const current = store.getMemories();
-      let nextMemories: RawMemoryInput[];
-      if (append) {
-        const existingIds = new Set(current.map((m) => m.id));
-        const merged = [
-          ...current.filter((m) => m.source !== 'demo'),
-          ...result.memories.filter((m) => !existingIds.has(m.id)),
-        ];
-        nextMemories = merged.length > 0 ? merged : result.memories;
-      } else {
-        nextMemories = result.memories;
+      const merged = mergeImportedMemories(store.getMemories(), result.memories, { append });
+
+      let archivedDamagedPath: string | undefined;
+      if (merged.added > 0 || !append || store.getState() !== 'loaded') {
+        const saved = await store.save(merged.memories);
+        archivedDamagedPath = saved.archivedDamagedPath;
       }
 
-      const { archivedDamagedPath } = await store.save(nextMemories);
+      const { graph } = getCachedResponseGraph();
       res.json({
-        imported: result.memories.length,
+        added: merged.added,
+        skipped: merged.skipped,
+        totalScanned: merged.totalScanned,
+        imported: merged.added,
         matchedSidecars: result.matchedSidecars,
         archivedDamagedPath,
-        graph: buildResponseGraph(),
+        graph,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to scan folder';
@@ -161,11 +196,13 @@ export function createServerApp(options?: CreateServerOptions) {
       const albumLabel = typeof req.body?.albumLabel === 'string' ? req.body.albumLabel.trim() : '';
 
       const jsonByKey = new Map<string, Record<string, unknown>>();
+      const jsonTempPaths: string[] = [];
       const imageFiles: Express.Multer.File[] = [];
 
       for (const file of files) {
         const lower = file.originalname.toLowerCase();
         if (lower.endsWith('.json')) {
+          jsonTempPaths.push(file.path);
           try {
             const parsed = JSON.parse(await fs.readFile(file.path, 'utf-8')) as Record<string, unknown>;
             const normalizedKey = file.originalname
@@ -183,6 +220,9 @@ export function createServerApp(options?: CreateServerOptions) {
           imageFiles.push(file);
         }
       }
+
+      // Clean up temporary uploaded sidecar JSON files once parsed
+      await Promise.all(jsonTempPaths.map((p) => fs.unlink(p).catch(() => {})));
 
       if (imageFiles.length === 0) {
         res.status(400).json({ error: 'Upload at least one photo (.jpg, .png, .webp).' });
@@ -208,17 +248,26 @@ export function createServerApp(options?: CreateServerOptions) {
         parsedMemories.push(mem);
       }
 
-      const current = store.getMemories();
-      const nextMemories = append
-        ? [...current.filter((m) => m.source !== 'demo'), ...parsedMemories]
-        : parsedMemories;
+      const merged = mergeImportedMemories(store.getMemories(), parsedMemories, { append });
 
-      const { archivedDamagedPath } = await store.save(nextMemories);
+      // Clean up redundant duplicate uploaded image files so disk doesn't accumulate duplicates
+      await Promise.all(merged.duplicateFilePaths.map((p) => fs.unlink(p).catch(() => {})));
+
+      let archivedDamagedPath: string | undefined;
+      if (merged.added > 0 || !append || store.getState() !== 'loaded') {
+        const saved = await store.save(merged.memories);
+        archivedDamagedPath = saved.archivedDamagedPath;
+      }
+
+      const { graph } = getCachedResponseGraph();
       res.json({
-        imported: parsedMemories.length,
+        added: merged.added,
+        skipped: merged.skipped,
+        totalScanned: merged.totalScanned,
+        imported: merged.added,
         matchedSidecars,
         archivedDamagedPath,
-        graph: buildResponseGraph(),
+        graph,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Upload failed';
@@ -239,10 +288,11 @@ export function createServerApp(options?: CreateServerOptions) {
         model,
       });
       await store.save(result.updated);
+      const { graph } = getCachedResponseGraph();
       res.json({
         enrichedCount: result.enrichedCount,
         errors: result.errors,
-        graph: buildResponseGraph(),
+        graph,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Gemini enrichment failed';
@@ -253,9 +303,10 @@ export function createServerApp(options?: CreateServerOptions) {
   app.post('/api/reset-demo', async (_req, res) => {
     try {
       const { archivedDamagedPath } = await store.resetToDemo();
+      const { graph } = getCachedResponseGraph();
       res.json({
         archivedDamagedPath,
-        graph: buildResponseGraph(),
+        graph,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Reset failed';
@@ -263,7 +314,7 @@ export function createServerApp(options?: CreateServerOptions) {
     }
   });
 
-  return { app, store, dataDir, uploadDir, storePath };
+  return { app, store, dataDir, uploadDir, storePath, getGraphCacheStats };
 }
 
 const isDirectEntry =

@@ -18,6 +18,7 @@ export interface RawMemoryInput {
   sceneKey?: string;
   imageUrl?: string;
   filePath?: string;
+  contentHash?: string;
   source: 'demo' | 'takeout' | 'upload';
   enriched?: boolean;
 }
