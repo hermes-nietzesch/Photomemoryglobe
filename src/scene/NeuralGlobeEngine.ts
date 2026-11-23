@@ -14,7 +14,11 @@ import type {
 } from '../../shared/types.ts';
 import { SYNAPSE_COLORS } from '../../shared/types.ts';
 import { WORLD_COASTLINES } from '../../shared/worldCoastlines.ts';
-import { latLngToCartesian } from '../../shared/graphEngine.ts';
+import {
+  CLUSTERS_PAGE_SIZE,
+  getClusterPage,
+  latLngToCartesian,
+} from '../../shared/graphEngine.ts';
 import { renderMemoryArtworkCanvas } from '../utils/memoryArt.ts';
 
 export interface ActiveFilter {
@@ -36,6 +40,7 @@ export interface EngineCallbacks {
   onSelectMemory: (memory: MemoryNode | null, viaEdge?: SynapseEdge | null) => void;
   onSynapseJump: (from: MemoryNode, to: MemoryNode, edge: SynapseEdge) => void;
   onOpenGroupChange?: (group: OpenedGroupInfo | null) => void;
+  onClusterPageChange?: (page: number) => void;
 }
 
 interface NodeVisual {
@@ -337,6 +342,7 @@ export class NeuralGlobeEngine {
   private graph: MemoryGraph | null = null;
   private morphMode: MorphMode = 'neural';
   private clusterDimension: ClusterDimension = 'event';
+  private clusterPage = 0;
   private openClusterId: string | null = null;
   private openGlobeGroupId: string | null = null;
   private filter: ActiveFilter = { kind: 'all', value: null };
@@ -814,6 +820,8 @@ export class NeuralGlobeEngine {
     this.edgesGroup.add(this.pulsePoints);
 
     // 4. Build Interactive Expandable Cluster Group Cards & Globe Region Cards
+    this.clusterPage = 0;
+    this.callbacks.onClusterPageChange?.(0);
     this.buildClusterGroupVisuals(graph);
     this.buildGlobeRegionVisuals(graph);
 
@@ -830,7 +838,9 @@ export class NeuralGlobeEngine {
     this.clearGroupCollection(this.clusterCardVisuals, this.clusterCardsGroup, this.clusterLinkVisuals, this.clusterLinksGroup);
     this.clusterHitMeshes = [];
 
-    const hubs = graph.hubs.filter((h) => h.kind === this.clusterDimension);
+    const pageInfo = getClusterPage(graph.hubs, this.clusterDimension, this.clusterPage, CLUSTERS_PAGE_SIZE);
+    this.clusterPage = pageInfo.page;
+    const hubs = pageInfo.items;
     const cardGeo = new THREE.PlaneGeometry(14.0, 9.6);
     const borderGeo = new THREE.PlaneGeometry(14.55, 10.15);
     const stackGeo = new THREE.PlaneGeometry(14.0, 9.6);
@@ -1282,10 +1292,12 @@ export class NeuralGlobeEngine {
   public setClusterDimension(dim: ClusterDimension): void {
     if (this.clusterDimension === dim) return;
     this.clusterDimension = dim;
+    this.clusterPage = 0;
     this.openClusterId = null;
     this.selectedId = null;
     this.callbacks.onSelectMemory(null, null);
     this.callbacks.onOpenGroupChange?.(null);
+    this.callbacks.onClusterPageChange?.(0);
     if (this.graph) {
       this.buildClusterGroupVisuals(this.graph);
     }
@@ -1295,8 +1307,41 @@ export class NeuralGlobeEngine {
     }
   }
 
+  public setClusterPage(page: number): void {
+    if (!this.graph) return;
+    const pageInfo = getClusterPage(this.graph.hubs, this.clusterDimension, page, CLUSTERS_PAGE_SIZE);
+    if (pageInfo.page === this.clusterPage && this.openClusterId === null) return;
+    this.clusterPage = pageInfo.page;
+    this.openClusterId = null;
+    this.selectedId = null;
+    this.callbacks.onSelectMemory(null, null);
+    this.callbacks.onOpenGroupChange?.(null);
+    this.callbacks.onClusterPageChange?.(this.clusterPage);
+    for (const nv of this.nodeVisuals.values()) {
+      nv.titleSprite.visible = false;
+      nv.group.visible = this.morphMode === 'neural';
+    }
+    this.buildClusterGroupVisuals(this.graph);
+    this.syncModeVisibility();
+    if (this.morphMode === 'clusters') {
+      this.resetCameraForMode('clusters');
+    }
+  }
+
   public openClusterGroup(groupId: string): void {
     if (!this.graph) return;
+    // If the target group belongs to another pagination page, switch to that page first
+    if (!this.clusterCardVisuals.has(groupId)) {
+      const dimHubs = this.graph.hubs.filter((h) => h.kind === this.clusterDimension);
+      const idx = dimHubs.findIndex((h) => h.id === groupId);
+      if (idx === -1) return;
+      const targetPage = Math.floor(idx / CLUSTERS_PAGE_SIZE);
+      if (targetPage !== this.clusterPage) {
+        this.clusterPage = targetPage;
+        this.callbacks.onClusterPageChange?.(targetPage);
+        this.buildClusterGroupVisuals(this.graph);
+      }
+    }
     const cv = this.clusterCardVisuals.get(groupId);
     if (!cv) return;
 
@@ -1558,9 +1603,10 @@ export class NeuralGlobeEngine {
 
     // If in Clusters or Earth Globe mode and jumping to a memory outside the currently opened group,
     // automatically open its containing group first so the photo is visible and framed cleanly!
-    if (this.morphMode === 'clusters') {
-      const targetHub = Array.from(this.clusterCardVisuals.values()).find((cv) =>
-        cv.memoryIds.includes(memoryId)
+    if (this.morphMode === 'clusters' && this.graph) {
+      // Search across ALL pages of the active cluster dimension so jumping to a group beyond #16 works seamlessly
+      const targetHub = this.graph.hubs.find(
+        (h) => h.kind === this.clusterDimension && h.memoryIds.includes(memoryId)
       );
       if (targetHub && this.openClusterId !== targetHub.id) {
         this.openClusterGroup(targetHub.id);

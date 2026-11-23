@@ -37,6 +37,35 @@ const BUCKET_EXHAUSTIVE_LIMIT = 40;
 const BUCKET_LOCAL_WINDOW = 10;
 const BUCKET_STRIDE_SAMPLES = 12;
 const TEMPORAL_WINDOW_LIMIT = 14;
+export const CLUSTERS_PAGE_SIZE = 16;
+
+export interface ClusterPageResult {
+  items: ClusterHub[];
+  page: number;
+  totalPages: number;
+  totalGroups: number;
+  pageSize: number;
+}
+
+export function getClusterPage(
+  hubs: ClusterHub[],
+  dimension: ClusterDimension,
+  page: number,
+  pageSize = CLUSTERS_PAGE_SIZE
+): ClusterPageResult {
+  const filtered = hubs.filter((h) => h.kind === dimension);
+  const totalGroups = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(totalGroups / pageSize));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const start = safePage * pageSize;
+  return {
+    items: filtered.slice(start, start + pageSize),
+    page: safePage,
+    totalPages,
+    totalGroups,
+    pageSize,
+  };
+}
 
 export function formatDateLabel(timestamp: number): string {
   const d = new Date(timestamp);
@@ -403,29 +432,37 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
   };
 
   for (const kind of ['event', 'person', 'place'] as const) {
+    // Keep EVERY distinct group in each dimension (no hard cap); lay out each page of up to 16 groups cleanly
     const labels = dimensionLists[kind]
       .slice()
-      .sort((a, b) => (memberMaps[kind].get(b)?.length || 0) - (memberMaps[kind].get(a)?.length || 0))
-      .slice(0, 16);
-    const positions = layoutPanoramicGroups(labels.length);
+      .sort(
+        (a, b) =>
+          (memberMaps[kind].get(b)?.length || 0) - (memberMaps[kind].get(a)?.length || 0) ||
+          a.localeCompare(b)
+      );
 
-    labels.forEach((label, idx) => {
-      const members = memberMaps[kind].get(label) ?? [];
-      if (members.length === 0) return;
-      const pos = positions[idx];
-      if (kind === 'event') eventHubPosMap.set(label, pos);
+    for (let pageStart = 0; pageStart < labels.length; pageStart += CLUSTERS_PAGE_SIZE) {
+      const pageLabels = labels.slice(pageStart, pageStart + CLUSTERS_PAGE_SIZE);
+      const positions = layoutPanoramicGroups(pageLabels.length);
 
-      hubs.push({
-        id: `${kind}:${label}`,
-        kind,
-        label,
-        color: SYNAPSE_COLORS[kind],
-        count: members.length,
-        position: pos,
-        memoryIds: members.map((m) => m.id),
-        representativeId: members[0].id,
+      pageLabels.forEach((label, idx) => {
+        const members = memberMaps[kind].get(label) ?? [];
+        if (members.length === 0) return;
+        const pos = positions[idx];
+        if (kind === 'event') eventHubPosMap.set(label, pos);
+
+        hubs.push({
+          id: `${kind}:${label}`,
+          kind,
+          label,
+          color: SYNAPSE_COLORS[kind],
+          count: members.length,
+          position: pos,
+          memoryIds: members.map((m) => m.id),
+          representativeId: members[0].id,
+        });
       });
-    });
+    }
   }
 
   // 2. Anchor regions on the inside-out Neural Dome per event so memories form cortical neighborhoods

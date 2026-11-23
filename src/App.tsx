@@ -17,6 +17,8 @@ import {
   AlertTriangle,
   RefreshCw,
   ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 import type {
   ClusterDimension,
@@ -29,7 +31,7 @@ import type {
 } from '../shared/types.ts';
 import { SYNAPSE_COLORS } from '../shared/types.ts';
 import { DEMO_MEMORIES } from '../shared/demoMemories.ts';
-import { buildMemoryGraph } from '../shared/graphEngine.ts';
+import { buildMemoryGraph, CLUSTERS_PAGE_SIZE, getClusterPage } from '../shared/graphEngine.ts';
 import {
   NeuralGlobeEngine,
   type ActiveFilter,
@@ -52,6 +54,7 @@ export const App: React.FC = () => {
   const [graph, setGraph] = useState<MemoryGraph | null>(null);
   const [morphMode, setMorphMode] = useState<MorphMode>('neural');
   const [clusterDimension, setClusterDimension] = useState<ClusterDimension>('event');
+  const [clusterPage, setClusterPage] = useState(0);
   const [openedGroup, setOpenedGroup] = useState<OpenedGroupInfo | null>(null);
   const [hoveredMemory, setHoveredMemory] = useState<MemoryNode | null>(null);
   const [hoveredGroupLabel, setHoveredGroupLabel] = useState<string | null>(null);
@@ -94,6 +97,7 @@ export const App: React.FC = () => {
       },
       onSynapseJump: (from, to, edge) => showSynapseToast(from, to, edge),
       onOpenGroupChange: (grp) => setOpenedGroup(grp),
+      onClusterPageChange: (page) => setClusterPage(page),
     });
     engineRef.current = engine;
 
@@ -171,8 +175,15 @@ export const App: React.FC = () => {
 
   const handleClusterDimensionChange = (dim: ClusterDimension) => {
     setClusterDimension(dim);
+    setClusterPage(0);
     setOpenedGroup(null);
     engineRef.current?.setClusterDimension(dim);
+  };
+
+  const handleClusterPageChange = (nextPage: number) => {
+    setClusterPage(nextPage);
+    setOpenedGroup(null);
+    engineRef.current?.setClusterPage(nextPage);
   };
 
   const handleApplyFilter = (kind: SynapseKind | 'all', value: string | null) => {
@@ -247,6 +258,10 @@ export const App: React.FC = () => {
     if (filterCategory === 'theme') return graph.stats.themes;
     return [];
   })();
+
+  const clusterPageInfo = graph
+    ? getClusterPage(graph.hubs, clusterDimension, clusterPage, CLUSTERS_PAGE_SIZE)
+    : null;
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#03050b] select-none">
@@ -419,33 +434,63 @@ export const App: React.FC = () => {
             </div>
           ) : (
             morphMode === 'clusters' && (
-              <div className="glass-pill rounded-full p-1 flex items-center gap-1 text-[11px]">
-                <span className="px-2.5 text-slate-400">Group by</span>
-                {(
-                  [
-                    { id: 'event', label: 'Events' },
-                    { id: 'person', label: 'People' },
-                    { id: 'place', label: 'Places' },
-                  ] as const
-                ).map(({ id, label }) => {
-                  const active = clusterDimension === id;
-                  const col = SYNAPSE_COLORS[id];
-                  return (
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <div className="glass-pill rounded-full p-1 flex items-center gap-1 text-[11px]">
+                  <span className="px-2.5 text-slate-400">Group by</span>
+                  {(
+                    [
+                      { id: 'event', label: 'Events' },
+                      { id: 'person', label: 'People' },
+                      { id: 'place', label: 'Places' },
+                    ] as const
+                  ).map(({ id, label }) => {
+                    const active = clusterDimension === id;
+                    const col = SYNAPSE_COLORS[id];
+                    return (
+                      <button
+                        key={id}
+                        onClick={() => handleClusterDimensionChange(id)}
+                        className={`px-3 py-1 rounded-full font-medium inline-flex items-center gap-1.5 transition cursor-pointer ${
+                          active ? 'bg-white/15 text-white' : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        <span
+                          className="w-1.5 h-1.5 rounded-full"
+                          style={{ backgroundColor: col }}
+                        />
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {clusterPageInfo && clusterPageInfo.totalPages > 1 && (
+                  <div className="glass-pill rounded-full p-1 flex items-center gap-1 text-[11px]">
                     <button
-                      key={id}
-                      onClick={() => handleClusterDimensionChange(id)}
-                      className={`px-3 py-1 rounded-full font-medium inline-flex items-center gap-1.5 transition cursor-pointer ${
-                        active ? 'bg-white/15 text-white' : 'text-slate-400 hover:text-slate-200'
-                      }`}
+                      onClick={() => handleClusterPageChange(clusterPageInfo.page - 1)}
+                      disabled={clusterPageInfo.page === 0}
+                      className="px-2.5 py-1 rounded-full text-slate-200 hover:bg-white/10 disabled:opacity-35 disabled:cursor-not-allowed inline-flex items-center gap-1 transition cursor-pointer"
+                      aria-label="Previous groups page"
                     >
-                      <span
-                        className="w-1.5 h-1.5 rounded-full"
-                        style={{ backgroundColor: col }}
-                      />
-                      {label}
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                      <span>Prev</span>
                     </button>
-                  );
-                })}
+                    <span className="px-2 font-mono-tech text-[10px] text-slate-300 whitespace-nowrap">
+                      {clusterPageInfo.page * clusterPageInfo.pageSize + 1}–
+                      {clusterPageInfo.page * clusterPageInfo.pageSize + clusterPageInfo.items.length} of{' '}
+                      {clusterPageInfo.totalGroups}
+                    </span>
+                    <button
+                      onClick={() => handleClusterPageChange(clusterPageInfo.page + 1)}
+                      disabled={clusterPageInfo.page >= clusterPageInfo.totalPages - 1}
+                      className="px-2.5 py-1 rounded-full text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-35 disabled:cursor-not-allowed inline-flex items-center gap-1 font-medium transition cursor-pointer"
+                      aria-label="More groups"
+                    >
+                      <span>More groups</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
               </div>
             )
           )}
