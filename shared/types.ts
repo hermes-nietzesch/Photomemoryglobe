@@ -44,13 +44,30 @@ export interface SynapseEdge {
   reasons: Array<{ kind: SynapseKind; label: string }>;
 }
 
+export type ClusterDimension = 'event' | 'person' | 'place';
+
 export interface ClusterHub {
   id: string;
-  kind: 'person' | 'place' | 'event';
+  kind: ClusterDimension;
   label: string;
   color: string;
   count: number;
   position: [number, number, number];
+  memoryIds: string[];
+  representativeId: string;
+}
+
+export interface GlobeRegionGroup {
+  id: string;
+  label: string;
+  lat: number;
+  lng: number;
+  color: string;
+  count: number;
+  memoryIds: string[];
+  representativeId: string;
+  surfacePos: [number, number, number];
+  pinPos: [number, number, number];
 }
 
 export interface MemoryGraphStats {
@@ -78,6 +95,7 @@ export interface MemoryGraph {
   memories: MemoryNode[];
   edges: SynapseEdge[];
   hubs: ClusterHub[];
+  globeGroups: GlobeRegionGroup[];
   stats: MemoryGraphStats;
   storageState?: StorageHealthState;
   storageRecovery?: StorageRecoveryInfo | null;

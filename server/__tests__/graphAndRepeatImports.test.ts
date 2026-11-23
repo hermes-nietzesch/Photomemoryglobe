@@ -7,8 +7,8 @@ import { performance } from 'node:perf_hooks';
 import type { AddressInfo } from 'node:net';
 import type http from 'node:http';
 import { createServerApp } from '../index.ts';
-import { buildMemoryGraph } from '../../shared/graphEngine.ts';
-import type { MemoryGraph, RawMemoryInput } from '../../shared/types.ts';
+import { buildMemoryGraph, CLUSTERS_PAGE_SIZE, getClusterPage } from '../../shared/graphEngine.ts';
+import type { ClusterDimension, MemoryGraph, RawMemoryInput } from '../../shared/types.ts';
 
 // Distinct tiny valid PNG buffers (different pixel/chunk data -> unique SHA-256 content hashes)
 const PNG_A = Buffer.from(
@@ -502,6 +502,97 @@ describe('Graph caching, 1,500-photo scale, repeat imports & cross-year E2E (Iss
       // Duplicate uploaded file should have been cleaned up
       const uploadFiles = await fs.readdir(ctx.uploadDir);
       assert.equal(uploadFiles.length, 0);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((err) => (err ? reject(err) : resolve()))
+      );
+    }
+  });
+
+  it('Clusters pagination: preserves and reaches the 17th group and its photo across Events, People, and Places', async () => {
+    // Build a real 17-photo collection where each photo has a distinct Event, Person, and Place
+    const collectionDir = path.join(tmpDir, 'SeventeenGroups');
+    await fs.mkdir(collectionDir, { recursive: true });
+
+    const photoBytesByIndex: Buffer[] = [];
+    for (let i = 1; i <= 17; i++) {
+      const idx = String(i).padStart(2, '0');
+      const albumDir = path.join(collectionDir, `Event ${idx}`);
+      await fs.mkdir(albumDir, { recursive: true });
+
+      // Unique bytes per PNG (append harmless trailing comment bytes after IEND so every SHA-256 is distinct)
+      const uniquePng = Buffer.concat([PNG_A, Buffer.from(`#photo-${idx}`)]);
+      photoBytesByIndex.push(uniquePng);
+
+      const fileName = `photo_${idx}.png`;
+      await fs.writeFile(path.join(albumDir, fileName), uniquePng);
+      await fs.writeFile(
+        path.join(albumDir, `${fileName}.json`),
+        JSON.stringify({
+          title: fileName,
+          description: `Memory from Event ${idx}`,
+          photoTakenTime: { timestamp: String(Math.floor(Date.parse(`2025-01-${idx}T12:00:00Z`) / 1000)) },
+          // Spread GPS coordinates so each photo maps to a distinct inferred Place label
+          geoData: { latitude: 10 + i * 2.5, longitude: -100 + i * 4.5 },
+          people: [{ name: `Person ${idx}` }],
+        })
+      );
+    }
+
+    const ctx = createServerApp({ dataDir });
+    await ctx.store.load();
+    const server = await new Promise<http.Server>((resolve) => {
+      const s = ctx.app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    try {
+      const imp = await fetch(`${baseUrl}/api/import/folder`, {
+        method: 'POST',
+        headers: { ...LOCAL_HEADERS, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folderPath: collectionDir }),
+      });
+      assert.equal(imp.status, 200);
+      const { graph } = (await imp.json()) as { graph: MemoryGraph };
+      assert.equal(graph.memories.length, 17);
+
+      const checks: Array<{ dim: ClusterDimension; expected17thLabel: string }> = [
+        { dim: 'event', expected17thLabel: 'Event 17' },
+        { dim: 'person', expected17thLabel: 'Person 17' },
+        { dim: 'place', expected17thLabel: graph.memories.find((m) => m.event === 'Event 17')!.locationName },
+      ];
+
+      for (const { dim, expected17thLabel } of checks) {
+        const allDimHubs = graph.hubs.filter((h) => h.kind === dim);
+        assert.equal(allDimHubs.length, 17, `Expected all 17 ${dim} groups to be preserved`);
+
+        // Page 0 keeps overview readable at <= 16 cards; Page 1 reaches the 17th group
+        const page0 = getClusterPage(graph.hubs, dim, 0, CLUSTERS_PAGE_SIZE);
+        const page1 = getClusterPage(graph.hubs, dim, 1, CLUSTERS_PAGE_SIZE);
+        assert.equal(page0.totalGroups, 17);
+        assert.equal(page0.totalPages, 2);
+        assert.equal(page0.items.length, 16);
+        assert.equal(page1.items.length, 1);
+
+        // Locate the 17th group across pages (verify it is reachable, selectable, and opens its photo)
+        const combinedLabels = [...page0.items, ...page1.items].map((h) => h.label);
+        assert.ok(
+          combinedLabels.includes(expected17thLabel),
+          `Expected ${dim} group "${expected17thLabel}" to be reachable via pagination`
+        );
+
+        const seventeenthHub = page1.items[0];
+        assert.equal(seventeenthHub.memoryIds.length, 1);
+        const photoId = seventeenthHub.memoryIds[0];
+        const memoryNode = graph.memories.find((m) => m.id === photoId);
+        assert.ok(memoryNode, `Expected photo ${photoId} from 17th ${dim} group to exist in graph`);
+
+        // Verify the photo inside the 17th group can actually be opened via /api/media/:id
+        const mediaRes = await fetch(`${baseUrl}/api/media/${photoId}`, { headers: LOCAL_HEADERS });
+        assert.equal(mediaRes.status, 200);
+        const mediaBytes = Buffer.from(await mediaRes.arrayBuffer());
+        assert.ok(mediaBytes.byteLength > PNG_A.byteLength);
+      }
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((err) => (err ? reject(err) : resolve()))
