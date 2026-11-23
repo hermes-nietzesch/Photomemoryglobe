@@ -62,11 +62,24 @@ export interface MemoryGraphStats {
   source: 'demo' | 'imported' | 'mixed';
 }
 
+export type StorageHealthState = 'demo' | 'loaded' | 'damaged';
+
+export interface StorageRecoveryInfo {
+  code: 'DAMAGED_INDEX' | 'READ_ERROR';
+  message: string;
+  damagedPath: string;
+  archivedPath?: string;
+  detail: string;
+  detectedAt: string;
+}
+
 export interface MemoryGraph {
   memories: MemoryNode[];
   edges: SynapseEdge[];
   hubs: ClusterHub[];
   stats: MemoryGraphStats;
+  storageState?: StorageHealthState;
+  storageRecovery?: StorageRecoveryInfo | null;
 }
 
 export const SYNAPSE_COLORS: Record<SynapseKind, string> = {

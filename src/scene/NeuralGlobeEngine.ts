@@ -96,7 +96,9 @@ function createMemoryCardTexture(memory: MemoryNode): THREE.CanvasTexture {
 
   if (memory.imageUrl) {
     const img = new Image();
-    img.crossOrigin = 'anonymous';
+    if (!memory.imageUrl.startsWith('/')) {
+      img.crossOrigin = 'anonymous';
+    }
     img.onload = () => {
       const c = document.createElement('canvas');
       c.width = 384;
