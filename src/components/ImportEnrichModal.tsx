@@ -62,11 +62,17 @@ export const ImportEnrichModal: React.FC<ImportEnrichModalProps> = ({
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Folder import failed');
+      const added = data.added ?? data.imported ?? 0;
+      const skipped = data.skipped ?? 0;
+      const skipNote = skipped > 0 ? `, skipped ${skipped} duplicate${skipped === 1 ? '' : 's'}` : '';
       setStatusMsg({
         type: 'ok',
-        text: `Imported ${data.imported} memories (${data.matchedSidecars} Google Takeout JSON sidecars matched).`,
+        text: `Added ${added} memor${added === 1 ? 'y' : 'ies'}${skipNote} (${data.matchedSidecars} Google Takeout JSON sidecars matched).`,
       });
-      onGraphUpdated(data.graph, `Imported ${data.imported} personal memories into the Neural Globe`);
+      onGraphUpdated(
+        data.graph,
+        `Added ${added} personal memor${added === 1 ? 'y' : 'ies'}${skipNote}`
+      );
     } catch (err) {
       setStatusMsg({ type: 'err', text: err instanceof Error ? err.message : 'Import failed' });
     } finally {
@@ -90,11 +96,14 @@ export const ImportEnrichModal: React.FC<ImportEnrichModalProps> = ({
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Upload failed');
+      const added = data.added ?? data.imported ?? 0;
+      const skipped = data.skipped ?? 0;
+      const skipNote = skipped > 0 ? `, skipped ${skipped} duplicate${skipped === 1 ? '' : 's'}` : '';
       setStatusMsg({
         type: 'ok',
-        text: `Loaded ${data.imported} photos (${data.matchedSidecars} Takeout metadata files matched).`,
+        text: `Added ${added} photo${added === 1 ? '' : 's'}${skipNote} (${data.matchedSidecars} Takeout metadata files matched).`,
       });
-      onGraphUpdated(data.graph, `Loaded ${data.imported} uploaded memories`);
+      onGraphUpdated(data.graph, `Added ${added} uploaded memor${added === 1 ? 'y' : 'ies'}${skipNote}`);
     } catch (err) {
       setStatusMsg({ type: 'err', text: err instanceof Error ? err.message : 'Upload failed' });
     } finally {
