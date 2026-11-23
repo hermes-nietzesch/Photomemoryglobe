@@ -80,9 +80,9 @@ export const MemoryInspector: React.FC<MemoryInspectorProps> = ({
 
         <div className="absolute bottom-3 left-4 right-4">
           {arrivedVia && (
-            <div className="inline-flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-cyan-200 bg-cyan-950/70 border border-cyan-400/30 px-2 py-0.5 rounded-full mb-1.5">
+            <div className="inline-flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-cyan-200 bg-cyan-950/80 border border-cyan-400/35 px-2.5 py-0.5 rounded-full mb-1.5">
               <Zap className="w-2.5 h-2.5 text-cyan-300" />
-              Synapse via {arrivedVia.label}
+              Synapse via {arrivedVia.reasons.map((r) => r.label).slice(0, 2).join(' · ') || arrivedVia.label}
             </div>
           )}
           <h3 className="font-editorial text-2xl leading-tight text-white drop-shadow">

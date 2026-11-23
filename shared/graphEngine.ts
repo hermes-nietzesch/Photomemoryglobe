@@ -1,5 +1,7 @@
 import type {
+  ClusterDimension,
   ClusterHub,
+  GlobeRegionGroup,
   MemoryGraph,
   MemoryNode,
   RawMemoryInput,
@@ -169,6 +171,178 @@ function scorePair(
   };
 }
 
+function layoutPanoramicGroups(count: number): Array<[number, number, number]> {
+  if (count <= 0) return [];
+  const cols = count <= 4 ? count : count <= 8 ? 4 : count <= 12 ? 4 : 5;
+  const rows = Math.ceil(count / cols);
+
+  // Align horizontal axis smoothly with the default Clusters overview camera (yaw = -0.35)
+  const yaw = -0.35;
+  const rx = Math.cos(yaw);
+  const rz = -Math.sin(yaw);
+  const fx = Math.sin(yaw);
+  const fz = Math.cos(yaw);
+
+  const spacingX = cols <= 3 ? 44 : cols === 4 ? 38 : 32;
+  const spacingY = rows <= 2 ? 32 : rows === 3 ? 27 : 23;
+
+  const positions: Array<[number, number, number]> = [];
+  for (let i = 0; i < count; i++) {
+    const row = Math.floor(i / cols);
+    const rowCount = row === rows - 1 ? count - row * cols : cols;
+    const col = i % cols;
+
+    // Center each row horizontally; stagger alternating rows slightly for organic constellation flow
+    const u = (col - (rowCount - 1) / 2) * spacingX + (row % 2 === 1 && rowCount === cols ? 4.5 : 0);
+    const v = ((rows - 1) / 2 - row) * spacingY;
+    // Gentle concave amphitheater curve so outer groups sit slightly closer to the viewer
+    const normalizedU = u / Math.max(1, (cols * spacingX) / 2);
+    const depthCurve = normalizedU * normalizedU * 14 - 4;
+
+    const x = rx * u + fx * depthCurve;
+    const y = v;
+    const z = rz * u + fz * depthCurve;
+    positions.push([x, y, z]);
+  }
+  return positions;
+}
+
+function angularDistanceDeg(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const toRad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * toRad;
+  const dLng = (lng2 - lng1) * toRad;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLng / 2) ** 2;
+  return (2 * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0, 1 - a)))) / toRad;
+}
+
+function deriveRegionLabel(members: MemoryNode[]): string {
+  const names = members.map((m) => m.locationName.trim()).filter(Boolean);
+  const uniqueNames = Array.from(new Set(names));
+  if (uniqueNames.length === 0) return 'Mapped Region';
+  if (uniqueNames.length === 1) return uniqueNames[0];
+
+  // If all locations share the same country suffix (e.g., "Kyoto, Japan", "Tokyo, Japan"), use the country/region
+  const countries = uniqueNames.map((n) => {
+    const parts = n.split(',').map((p) => p.trim());
+    return parts.length > 1 ? parts[parts.length - 1] : n;
+  });
+  const uniqueCountries = Array.from(new Set(countries));
+  if (uniqueCountries.length === 1) {
+    // Special case: US coastal cluster -> show most frequent city + region
+    if (uniqueCountries[0] === 'USA') {
+      const freq = new Map<string, number>();
+      for (const n of names) freq.set(n, (freq.get(n) || 0) + 1);
+      const top = [...freq.entries()].sort((a, b) => b[1] - a[1])[0][0];
+      return top.replace(/, USA$/, ' Area');
+    }
+    return uniqueCountries[0];
+  }
+
+  // Otherwise pick the most frequent city/location
+  const freq = new Map<string, number>();
+  for (const n of names) freq.set(n, (freq.get(n) || 0) + 1);
+  return [...freq.entries()].sort((a, b) => b[1] - a[1])[0][0];
+}
+
+function buildGlobeRegionGroups(memories: MemoryNode[]): GlobeRegionGroup[] {
+  const geotagged = memories.filter(
+    (m) => typeof m.lat === 'number' && typeof m.lng === 'number' && (m.lat !== 0 || m.lng !== 0)
+  );
+  const unmapped = memories.filter(
+    (m) => !(typeof m.lat === 'number' && typeof m.lng === 'number' && (m.lat !== 0 || m.lng !== 0))
+  );
+
+  // Agglomerative geographic clustering within 6.5 degrees (~720 km) so neighboring countries stay distinct
+  const clusters: Array<{
+    lat: number;
+    lng: number;
+    latSum: number;
+    lngSum: number;
+    members: MemoryNode[];
+  }> = [];
+  const MERGE_THRESHOLD_DEG = 6.5;
+
+  for (const mem of geotagged) {
+    let bestCluster: (typeof clusters)[number] | null = null;
+    let bestDist = Infinity;
+    for (const c of clusters) {
+      const d = angularDistanceDeg(mem.lat!, mem.lng!, c.lat, c.lng);
+      if (d <= MERGE_THRESHOLD_DEG && d < bestDist) {
+        bestDist = d;
+        bestCluster = c;
+      }
+    }
+    if (bestCluster) {
+      bestCluster.members.push(mem);
+      bestCluster.latSum += mem.lat!;
+      bestCluster.lngSum += mem.lng!;
+      bestCluster.lat = bestCluster.latSum / bestCluster.members.length;
+      bestCluster.lng = bestCluster.lngSum / bestCluster.members.length;
+    } else {
+      clusters.push({
+        lat: mem.lat!,
+        lng: mem.lng!,
+        latSum: mem.lat!,
+        lngSum: mem.lng!,
+        members: [mem],
+      });
+    }
+  }
+
+  // Sort largest clusters first for stable deterministic elevation offsets
+  clusters.sort((a, b) => b.members.length - a.members.length);
+
+  const groups: GlobeRegionGroup[] = clusters.map((c, idx) => {
+    const sortedMembers = [...c.members].sort((a, b) => b.degree - a.degree || b.timestamp - a.timestamp);
+    const rep = sortedMembers[0];
+    const label = deriveRegionLabel(sortedMembers);
+
+    // Slight altitude variation if another cluster is nearby (< 18 deg) so labels & pins separate cleanly
+    let nearbyCount = 0;
+    for (let k = 0; k < idx; k++) {
+      if (angularDistanceDeg(c.lat, c.lng, clusters[k].lat, clusters[k].lng) < 18) {
+        nearbyCount++;
+      }
+    }
+    const surfacePos = latLngToCartesian(c.lat, c.lng, 54.35);
+    const pinPos = latLngToCartesian(c.lat, c.lng, 62.5 + nearbyCount * 3.4);
+
+    return {
+      id: `globe:${idx}:${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      label,
+      lat: c.lat,
+      lng: c.lng,
+      color: rep.palette[0] || '#22d3ee',
+      count: sortedMembers.length,
+      memoryIds: sortedMembers.map((m) => m.id),
+      representativeId: rep.id,
+      surfacePos,
+      pinPos,
+    };
+  });
+
+  if (unmapped.length > 0) {
+    const sortedUnmapped = [...unmapped].sort((a, b) => b.degree - a.degree);
+    const rep = sortedUnmapped[0];
+    groups.push({
+      id: 'globe:unmapped',
+      label: 'Unmapped Orbit',
+      lat: 0,
+      lng: 0,
+      color: '#a78bfa',
+      count: sortedUnmapped.length,
+      memoryIds: sortedUnmapped.map((m) => m.id),
+      representativeId: rep.id,
+      surfacePos: [72, 0, 0],
+      pinPos: [76, 6, 0],
+    });
+  }
+
+  return groups;
+}
+
 export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
   const sorted = [...rawInputs].sort((a, b) => a.timestamp - b.timestamp);
 
@@ -190,47 +364,69 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
   const placesList = Array.from(placeSet);
   const themesList = Array.from(themeSet);
 
-  // 1. Build Cluster Hubs for `clusters` mode
-  const hubs: ClusterHub[] = [];
-  const hubMap = new Map<string, ClusterHub>();
+  // 1. Pre-group memories per dimension for ClusterHubs (wide panoramic layout per dimension)
+  const dimensionLists: Record<ClusterDimension, string[]> = {
+    event: eventsList,
+    person: peopleList,
+    place: placesList,
+  };
 
-  const hubEntries: Array<{ kind: 'person' | 'place' | 'event'; label: string }> = [
-    ...peopleList.slice(0, 14).map((label) => ({ kind: 'person' as const, label })),
-    ...placesList.slice(0, 14).map((label) => ({ kind: 'place' as const, label })),
-    ...eventsList.slice(0, 14).map((label) => ({ kind: 'event' as const, label })),
-  ];
+  const eventMembers = new Map<string, RawMemoryInput[]>();
+  const personMembers = new Map<string, RawMemoryInput[]>();
+  const placeMembers = new Map<string, RawMemoryInput[]>();
 
-  const countByKey = new Map<string, number>();
   for (const m of sorted) {
+    if (m.event) {
+      const list = eventMembers.get(m.event) ?? [];
+      list.push(m);
+      eventMembers.set(m.event, list);
+    }
     for (const p of m.people) {
-      const k = `person:${p}`;
-      countByKey.set(k, (countByKey.get(k) || 0) + 1);
+      const list = personMembers.get(p) ?? [];
+      list.push(m);
+      personMembers.set(p, list);
     }
     if (m.locationName) {
-      const k = `place:${m.locationName}`;
-      countByKey.set(k, (countByKey.get(k) || 0) + 1);
-    }
-    if (m.event) {
-      const k = `event:${m.event}`;
-      countByKey.set(k, (countByKey.get(k) || 0) + 1);
+      const list = placeMembers.get(m.locationName) ?? [];
+      list.push(m);
+      placeMembers.set(m.locationName, list);
     }
   }
 
-  hubEntries.forEach((entry, idx) => {
-    const bandRadius = entry.kind === 'person' ? 46 : entry.kind === 'place' ? 58 : 34;
-    const pos = fibonacciSpherePoint(idx, hubEntries.length, bandRadius);
-    const key = `${entry.kind}:${entry.label}`;
-    const hub: ClusterHub = {
-      id: key,
-      kind: entry.kind,
-      label: entry.label,
-      color: SYNAPSE_COLORS[entry.kind],
-      count: countByKey.get(key) || 1,
-      position: pos,
-    };
-    hubs.push(hub);
-    hubMap.set(key, hub);
-  });
+  const hubs: ClusterHub[] = [];
+  const eventHubPosMap = new Map<string, [number, number, number]>();
+
+  const memberMaps: Record<ClusterDimension, Map<string, RawMemoryInput[]>> = {
+    event: eventMembers,
+    person: personMembers,
+    place: placeMembers,
+  };
+
+  for (const kind of ['event', 'person', 'place'] as const) {
+    const labels = dimensionLists[kind]
+      .slice()
+      .sort((a, b) => (memberMaps[kind].get(b)?.length || 0) - (memberMaps[kind].get(a)?.length || 0))
+      .slice(0, 16);
+    const positions = layoutPanoramicGroups(labels.length);
+
+    labels.forEach((label, idx) => {
+      const members = memberMaps[kind].get(label) ?? [];
+      if (members.length === 0) return;
+      const pos = positions[idx];
+      if (kind === 'event') eventHubPosMap.set(label, pos);
+
+      hubs.push({
+        id: `${kind}:${label}`,
+        kind,
+        label,
+        color: SYNAPSE_COLORS[kind],
+        count: members.length,
+        position: pos,
+        memoryIds: members.map((m) => m.id),
+        representativeId: members[0].id,
+      });
+    });
+  }
 
   // 2. Anchor regions on the inside-out Neural Dome per event so memories form cortical neighborhoods
   const eventAnchors = new Map<string, [number, number, number]>();
@@ -282,38 +478,8 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
       globePos = [Math.cos(angle) * r, y, Math.sin(angle) * r];
     }
 
-    // --- Clusters position (weighted centroid of its hubs + local orbit) ---
-    const relatedHubs: ClusterHub[] = [];
-    for (const p of item.people) {
-      const h = hubMap.get(`person:${p}`);
-      if (h) relatedHubs.push(h);
-    }
-    const placeHub = hubMap.get(`place:${item.locationName}`);
-    if (placeHub) relatedHubs.push(placeHub);
-    const eventHub = hubMap.get(`event:${item.event}`);
-    if (eventHub) relatedHubs.push(eventHub);
-
-    let cx = 0;
-    let cy = 0;
-    let cz = 0;
-    if (relatedHubs.length > 0) {
-      for (const h of relatedHubs) {
-        cx += h.position[0];
-        cy += h.position[1];
-        cz += h.position[2];
-      }
-      cx /= relatedHubs.length;
-      cy /= relatedHubs.length;
-      cz /= relatedHubs.length;
-      cx += seededNoise(item.id, 11) * 14;
-      cy += seededNoise(item.id, 12) * 14;
-      cz += seededNoise(item.id, 13) * 14;
-    } else {
-      const fallback = fibonacciSpherePoint(idx, sorted.length, 48);
-      cx = fallback[0];
-      cy = fallback[1];
-      cz = fallback[2];
-    }
+    // --- Clusters default anchor (its event hub position; individual members fan out on open) ---
+    const clusterAnchor = eventHubPosMap.get(item.event) ?? [0, 0, 0];
 
     return {
       ...item,
@@ -322,7 +488,7 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
       positions: {
         neural: [nx, ny, nz],
         globe: globePos,
-        clusters: [cx, cy, cz],
+        clusters: [clusterAnchor[0], clusterAnchor[1], clusterAnchor[2]],
       },
       degree: 0,
     };
@@ -490,6 +656,18 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
     m.degree = degreeMap.get(m.id) || 0;
   }
 
+  // Pick the highest-degree (most connected) memory as each ClusterHub's representative thumbnail
+  const memoryById = new Map(memories.map((m) => [m.id, m]));
+  for (const hub of hubs) {
+    const best = [...hub.memoryIds]
+      .map((id) => memoryById.get(id))
+      .filter((m): m is MemoryNode => Boolean(m))
+      .sort((a, b) => b.degree - a.degree || b.timestamp - a.timestamp)[0];
+    if (best) hub.representativeId = best.id;
+  }
+
+  const globeGroups = buildGlobeRegionGroups(memories);
+
   const sources = new Set(memories.map((m) => m.source));
   const source: MemoryGraph['stats']['source'] =
     sources.size === 1 && sources.has('demo')
@@ -502,6 +680,7 @@ export function buildMemoryGraph(rawInputs: RawMemoryInput[]): MemoryGraph {
     memories,
     edges,
     hubs,
+    globeGroups,
     stats: {
       totalMemories: memories.length,
       totalSynapses: edges.length,

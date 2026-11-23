@@ -16,8 +16,10 @@ import {
   X,
   AlertTriangle,
   RefreshCw,
+  ArrowLeft,
 } from 'lucide-react';
 import type {
+  ClusterDimension,
   MemoryGraph,
   MemoryNode,
   MorphMode,
@@ -28,7 +30,11 @@ import type {
 import { SYNAPSE_COLORS } from '../shared/types.ts';
 import { DEMO_MEMORIES } from '../shared/demoMemories.ts';
 import { buildMemoryGraph } from '../shared/graphEngine.ts';
-import { NeuralGlobeEngine, type ActiveFilter } from './scene/NeuralGlobeEngine.ts';
+import {
+  NeuralGlobeEngine,
+  type ActiveFilter,
+  type OpenedGroupInfo,
+} from './scene/NeuralGlobeEngine.ts';
 import { MemoryInspector } from './components/MemoryInspector.tsx';
 import { ImportEnrichModal } from './components/ImportEnrichModal.tsx';
 
@@ -45,7 +51,10 @@ export const App: React.FC = () => {
 
   const [graph, setGraph] = useState<MemoryGraph | null>(null);
   const [morphMode, setMorphMode] = useState<MorphMode>('neural');
+  const [clusterDimension, setClusterDimension] = useState<ClusterDimension>('event');
+  const [openedGroup, setOpenedGroup] = useState<OpenedGroupInfo | null>(null);
   const [hoveredMemory, setHoveredMemory] = useState<MemoryNode | null>(null);
+  const [hoveredGroupLabel, setHoveredGroupLabel] = useState<string | null>(null);
   const [selectedMemory, setSelectedMemory] = useState<MemoryNode | null>(null);
   const [arrivedVia, setArrivedVia] = useState<SynapseEdge | null>(null);
 
@@ -70,7 +79,7 @@ export const App: React.FC = () => {
       kind: edge.kind,
     });
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = window.setTimeout(() => setSynapseToast(null), 4200);
+    toastTimerRef.current = window.setTimeout(() => setSynapseToast(null), 5500);
   }, []);
 
   // Initialize Three.js NeuralGlobeEngine
@@ -78,11 +87,13 @@ export const App: React.FC = () => {
     if (!mountRef.current) return;
     const engine = new NeuralGlobeEngine(mountRef.current, {
       onHoverMemory: (mem) => setHoveredMemory(mem),
+      onHoverGroup: (label) => setHoveredGroupLabel(label),
       onSelectMemory: (mem, viaEdge) => {
         setSelectedMemory(mem);
         setArrivedVia(viaEdge ?? null);
       },
       onSynapseJump: (from, to, edge) => showSynapseToast(from, to, edge),
+      onOpenGroupChange: (grp) => setOpenedGroup(grp),
     });
     engineRef.current = engine;
 
@@ -154,7 +165,14 @@ export const App: React.FC = () => {
 
   const handleMorphChange = (mode: MorphMode) => {
     setMorphMode(mode);
+    setOpenedGroup(null);
     engineRef.current?.setMorphMode(mode);
+  };
+
+  const handleClusterDimensionChange = (dim: ClusterDimension) => {
+    setClusterDimension(dim);
+    setOpenedGroup(null);
+    engineRef.current?.setClusterDimension(dim);
   };
 
   const handleApplyFilter = (kind: SynapseKind | 'all', value: string | null) => {
@@ -377,28 +395,94 @@ export const App: React.FC = () => {
         </div>
       )}
 
+      {/* Contextual Sub-Bar for Clusters Grouping & Opened Group Breadcrumb */}
+      {!storageRecovery && (morphMode === 'clusters' || openedGroup) && (
+        <div className="fixed top-[68px] left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 pointer-events-auto">
+          {openedGroup ? (
+            <div className="glass-pill rounded-full px-3.5 py-1.5 flex items-center gap-2.5 text-xs shadow-lg">
+              <button
+                onClick={() => engineRef.current?.closeOpenGroup()}
+                className="inline-flex items-center gap-1 text-cyan-300 hover:text-cyan-200 font-medium transition cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                {openedGroup.mode === 'clusters' ? 'All Groups' : 'Globe Overview'}
+              </button>
+              <span className="text-slate-600">·</span>
+              <span
+                className="w-2 h-2 rounded-full"
+                style={{ backgroundColor: openedGroup.color, boxShadow: `0 0 8px ${openedGroup.color}` }}
+              />
+              <span className="text-white font-medium">{openedGroup.label}</span>
+              <span className="text-slate-400 font-mono-tech text-[11px]">
+                {openedGroup.count} {openedGroup.count === 1 ? 'memory' : 'memories'}
+              </span>
+            </div>
+          ) : (
+            morphMode === 'clusters' && (
+              <div className="glass-pill rounded-full p-1 flex items-center gap-1 text-[11px]">
+                <span className="px-2.5 text-slate-400">Group by</span>
+                {(
+                  [
+                    { id: 'event', label: 'Events' },
+                    { id: 'person', label: 'People' },
+                    { id: 'place', label: 'Places' },
+                  ] as const
+                ).map(({ id, label }) => {
+                  const active = clusterDimension === id;
+                  const col = SYNAPSE_COLORS[id];
+                  return (
+                    <button
+                      key={id}
+                      onClick={() => handleClusterDimensionChange(id)}
+                      className={`px-3 py-1 rounded-full font-medium inline-flex items-center gap-1.5 transition cursor-pointer ${
+                        active ? 'bg-white/15 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <span
+                        className="w-1.5 h-1.5 rounded-full"
+                        style={{ backgroundColor: col }}
+                      />
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            )
+          )}
+        </div>
+      )}
+
       {/* Synaptic Jump Breadcrumb Toast */}
       {synapseToast && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-30 glass-panel rounded-full px-4 py-2 flex items-center gap-2.5 text-xs pointer-events-none border-cyan-400/35">
-          <span className="text-slate-400 max-w-[140px] truncate">{synapseToast.fromTitle}</span>
+        <div
+          role="status"
+          className="fixed bottom-20 left-1/2 -translate-x-1/2 z-40 glass-panel rounded-full px-4 py-2 flex items-center gap-2.5 text-xs pointer-events-none border-cyan-400/45 shadow-2xl"
+        >
+          <span className="text-slate-300 max-w-[170px] truncate">{synapseToast.fromTitle}</span>
           <span
-            className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full font-medium text-[11px]"
+            className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full font-medium text-[11px] whitespace-nowrap"
             style={{
-              backgroundColor: `${SYNAPSE_COLORS[synapseToast.kind]}24`,
+              backgroundColor: `${SYNAPSE_COLORS[synapseToast.kind]}28`,
               color: SYNAPSE_COLORS[synapseToast.kind],
-              border: `1px solid ${SYNAPSE_COLORS[synapseToast.kind]}55`,
+              border: `1px solid ${SYNAPSE_COLORS[synapseToast.kind]}66`,
             }}
           >
             <Zap className="w-3 h-3" />
             {synapseToast.reason}
           </span>
-          <span className="text-white font-medium max-w-[160px] truncate">{synapseToast.toTitle}</span>
+          <span className="text-white font-medium max-w-[180px] truncate">{synapseToast.toTitle}</span>
         </div>
       )}
 
-      {/* Subtle Hover Memory Label */}
+      {/* Subtle Hover Memory or Group Label */}
+      {!synapseToast && hoveredGroupLabel && !hoveredMemory && (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-20 glass-pill rounded-full px-4 py-1.5 text-xs flex items-center gap-2 pointer-events-none">
+          <span className="text-white font-medium">{hoveredGroupLabel}</span>
+          <span className="text-cyan-300">· Click to open group</span>
+        </div>
+      )}
       {hoveredMemory && hoveredMemory.id !== selectedMemory?.id && !synapseToast && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-20 glass-pill rounded-full px-4 py-1.5 text-xs flex items-center gap-2 pointer-events-none">
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-20 glass-pill rounded-full px-4 py-1.5 text-xs flex items-center gap-2 pointer-events-none">
           <span
             className="w-2 h-2 rounded-full"
             style={{ backgroundColor: hoveredMemory.palette[0], boxShadow: `0 0 8px ${hoveredMemory.palette[0]}` }}
